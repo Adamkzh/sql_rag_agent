@@ -1,5 +1,6 @@
 Resilient Multi-Tool Agent (Text-to-SQL + Policy RAG)
 ======================================================
+<img width="2004" height="1251" alt="image" src="https://github.com/user-attachments/assets/cf929564-0d1d-44e1-b4e0-5b2a9982f817" />
 
 What it does
 ------------
@@ -8,6 +9,7 @@ What it does
 - Generates SQLite-safe, SELECT-only SQL with a retry-and-correct loop.
 - Masks PII (email, phone, address) in result rows; blocks explicit PII requests.
 - Emits JSONL trace logs for each step to `logs/trace.jsonl`.
+
 
 Routing pipeline
 ----------------
