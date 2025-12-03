@@ -3,10 +3,10 @@ Resilient Multi-Tool Agent (Text-to-SQL + Policy RAG)
 
 What it does
 ------------
-- Routes queries between SQL, docs, and hybrid modes using LLM function-calling logic.
-- Generates SQLite-safe SQL with a retry-and-correct loop.
-- Retrieves policy snippets from `data/policies.md` for business-rule alignment.
-- Masks PII (email, phone, address) before returning results.
+- Routes queries between SQL, docs, and hybrid modes using LLM + a deterministic keyword check for policy terms.
+- Injects business rules from `data/policies.md` (e.g., VIP > $1,000 in last 12 months) into SQL generation so constraints are enforced even if the user forgets them.
+- Generates SQLite-safe, SELECT-only SQL with a retry-and-correct loop.
+- Masks PII (email, phone, address) in result rows; blocks explicit PII requests.
 - Emits JSONL trace logs for each step to `logs/trace.jsonl`.
 
 Routing pipeline
@@ -15,10 +15,10 @@ Routing pipeline
 2. Policy-term rule check (deterministic fast-path).
 3. LLM-based boolean router decides `requires_sql` / `requires_policy`.
 4. Final routing decision fan-outs into three deterministic pipelines:
-   - **Case 1 — SQL only**: `[SQL1]` SQL generation → `[SQL2]` self-correction loop (max 3) → `[SQL3]` SQLite execution → `[SQL4]` PII guardrail filter → final answer.
-   - **Case 2 — Docs only**: `[DOC1]` retrieve policy context from `data/policies.md` → final answer.
-   - **Case 3 — Hybrid**: `[H1]` policy extraction → `[H2]` policy-injected SQL generation → `[H3]` self-correction loop → `[H4]` SQLite execution → `[H5]` PII guardrail filter → final answer.
-5. Every stage emits a structured trace log so you can audit decisions end-to-end.
+   - **Case 1 — SQL only**: `[SQL1]` SQL generation → `[SQL2]` retry/correct loop → `[SQL3]` SQLite execution → `[SQL4]` PII guardrail filter → final result.
+   - **Case 2 — Docs only**: `[DOC1]` retrieve policy context → policy-only answer.
+   - **Case 3 — Hybrid**: `[H1]` policy extraction → `[H2]` policy-injected SQL generation → `[H3]` retry/correct loop → `[H4]` SQLite execution → `[H5]` PII guardrail filter → returns SQL result (policy text is only used to shape the SQL).
+5. Every stage emits a structured trace log so you can audit decisions end-to-end (see `logs/trace.jsonl`).
 
 Project layout
 --------------
@@ -38,7 +38,7 @@ Setup
 -----
 1) Install dependencies:
 ```
-pip install -r requirements.txt
+pip install -r requirements.txt  # use python3/pip3 if needed
 ```
 2) (Optional) Set your key for live LLM calls:
 ```
