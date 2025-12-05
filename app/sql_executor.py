@@ -48,6 +48,23 @@ class SQLExecutor:
             try:
                 columns, data = self._run_sql(sql)
                 masked_data = self._mask_rows(columns, data)
+                if not masked_data:
+                    attempts.append({"attempt": attempt, "error": "Empty result set"})
+                    self.logger.log("sql_execute", attempt=attempt, status="empty", rows=0)
+                    if attempt == max_attempts:
+                        return {
+                            "columns": columns,
+                            "rows": masked_data,
+                            "attempts": attempts,
+                            "warning": "Empty result set",
+                        }
+                    sql = self.llm.correct_sql(
+                        sql,
+                        "Query returned zero rows; please regenerate the SQL to return likely results.",
+                        schema=schema_text,
+                    )
+                    self.logger.log("sql_retry_empty", attempt=attempt + 1, sql=sql)
+                    continue
                 self.logger.log("sql_execute", attempt=attempt, status="success", rows=len(masked_data))
                 return {"columns": columns, "rows": masked_data, "attempts": attempts}
             except Exception as exc:  # sqlite errors are informative

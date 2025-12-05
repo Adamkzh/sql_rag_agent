@@ -37,18 +37,6 @@ class Agent:
 
             route_info = self.router.route(query)
             decision = str(route_info.get("decision") or "docs")
-            self.logger.log(
-                "stage_case_selection_result",
-                query=query,
-                normalized_query=route_info.get("normalized_query"),
-                decision=decision,
-                requires_sql=bool(route_info.get("requires_sql")),
-                requires_policy=bool(route_info.get("requires_policy")),
-                unknown=bool(route_info.get("unknown")),
-                policy_keyword_hit=bool(route_info.get("policy_keyword_hit")),
-                embedding_decision=route_info.get("embedding_decision"),
-                source=str(route_info.get("source") or "router"),
-            )
 
             if route_info.get("unknown"):
                 return {"message": "I couldn't understand that request. Please rephrase or ask a specific question."}
@@ -122,8 +110,6 @@ class Agent:
     def _retrieve_policy_context(self, query: str, stage: str) -> str:
         full_context = self.docs.extract_rule(query)
         selected = self.llm.select_policy_context(query, full_context, fallback=full_context)
-        print("WTF")
-        print(selected)
         self.logger.log(
             stage,
             characters=len(selected),

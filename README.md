@@ -4,29 +4,26 @@ Resilient Multi-Tool Agent (Text-to-SQL + Policy RAG)
 
 What it does
 ------------
-- Routes queries between SQL, docs, and hybrid modes using LLM + a deterministic keyword check for policy terms.
+- Routes queries between SQL, docs, and hybrid modes using a multi-layer router (pre, policy keyword, embedding hook, LLM).
 - Injects business rules from `data/policies.md` (e.g., VIP > $1,000 in last 12 months) into SQL generation so constraints are enforced even if the user forgets them.
 - Generates SQLite-safe, SELECT-only SQL with a retry-and-correct loop.
 - Masks PII (email, phone, address) in result rows; blocks explicit PII requests.
 - Emits JSONL trace logs for each step to `logs/trace.jsonl`.
 
 
-Routing pipeline
-----------------
-1. Pre-router normalizes the query.
-2. Policy router flags obvious policy terms (deterministic fast-path).
-3. Embedding router hook (currently placeholder) can hint docs/sql once embeddings are wired in.
-4. LLM-based boolean router decides `requires_sql` / `requires_policy`.
-5. Final routing decision fan-outs into three deterministic pipelines:
-   - **Case 1 — SQL only**: `[SQL1]` SQL generation → `[SQL2]` retry/correct loop → `[SQL3]` SQLite execution → `[SQL4]` PII guardrail filter → final result.
-   - **Case 2 — Docs only**: `[DOC1]` retrieve policy context → policy-only answer.
-   - **Case 3 — Hybrid**: `[H1]` policy extraction → `[H2]` policy-injected SQL generation → `[H3]` retry/correct loop → `[H4]` SQLite execution → `[H5]` PII guardrail filter → returns SQL result (policy text is only used to shape the SQL).
-6. Every stage emits a structured trace log so you can audit decisions end-to-end (see `logs/trace.jsonl`).
+Setup Instructions
+------------------
+1) Install Python deps: `pip install -r requirements.txt` (use `python3/pip3` if needed).  
+2) Configure your OpenAI API key (required): `export OPENAI_API_KEY=sk-...`  
+3) Run the agent:  
+   - One-off: `python main.py "List VIP customers"`  
+   - Interactive: `python main.py` then type a query.  
+
 
 Project layout
 --------------
 - `app/agent.py` — orchestrates routing, SQL/doc handling, PII guardrail.
-- `app/router.py` — classifies queries (sql/docs/hybrid).
+- `app/router/` — multi-layer routing (pre, policy keyword, embedding hook, LLM, dynamic).
 - `app/docs_loader.py` — loads and searches policy docs.
 - `app/sql_executor.py` — SQLite executor with retry + LLM correction.
 - `app/pii.py` — PII detection and masking helpers.
@@ -37,28 +34,22 @@ Project layout
 - `main.py` — CLI entry point.
 - `requirements.txt` — dependencies (OpenAI SDK).
 
-Setup
------
-1) Install dependencies:
-```
-pip install -r requirements.txt  # use python3/pip3 if needed
-```
-2) (Optional) Set your key for live LLM calls:
-```
-export OPENAI_API_KEY=sk-...
-```
-An OpenAI API key is required; without it, LLM calls will fail and should be retried after the key is configured.
 
-Run the CLI demo
-----------------
-```
-python main.py "List VIP customers"
-```
-Or interactively:
-```
-python main.py
-Enter a query: show orders per customer
-```
+Architecture (Self-Correction + PII)
+------------------------------------
+High-level routing: `pre-router → policy/embedding hints → LLM router → (docs | sql | hybrid pipelines)`.
+
+- **Self-Correction Loop (SQL2)**  
+  - `agent._generate_sql` asks the LLM for SELECT-only SQL (policy constraints injected when hybrid).  
+  - `sql_executor.execute_with_retry` runs the query with guardrails (`_is_safe` blocks non-SELECT).  
+  - On SQLite errors or empty result sets, `llm.correct_sql` gets the failing SQL, schema summary, and error context to produce a revised query; retries up to `max_attempts`.  
+  - Logging stages: `stage_sql1_generation`, `stage_sql2_self_correction_loop`, `stage_sql3_sqlite_execution`.
+
+- **PII Filter (SQL4 + request guard)**  
+  - Request-time: `agent.handle` blocks queries asking for `email/phone/address/pii` and returns a safe message.  
+  - Response-time: `sql_executor._mask_rows` detects columns in `PII_FIELDS` and masks via `mask_record`; logs `stage_sql4_pii_guardrail` with whether masking applied.  
+  - Only SELECT statements are ever executed (`stage_sql_guardrail_check`).
+
 
 HTTP API + React UI
 -------------------
@@ -75,14 +66,11 @@ npm run dev
 ```
 The UI expects the API at `http://localhost:8000`. Override with `VITE_API_URL` if needed.
 
-PII guardrails
---------------
-- Requests for raw `email`, `phone`, or `address` are rejected with a safe message.
-- Any result set containing those fields is masked before returning.
 
 Logs
 ----
 - JSONL traces are written to `logs/trace.jsonl`. Each line includes `step`, timestamps, and context.
+
 
 Notes
 -----
