@@ -13,14 +13,15 @@ What it does
 
 Routing pipeline
 ----------------
-1. User query → optional normalization.
-2. Policy-term rule check (deterministic fast-path).
-3. LLM-based boolean router decides `requires_sql` / `requires_policy`.
-4. Final routing decision fan-outs into three deterministic pipelines:
+1. Pre-router normalizes the query.
+2. Policy router flags obvious policy terms (deterministic fast-path).
+3. Embedding router hook (currently placeholder) can hint docs/sql once embeddings are wired in.
+4. LLM-based boolean router decides `requires_sql` / `requires_policy`.
+5. Final routing decision fan-outs into three deterministic pipelines:
    - **Case 1 — SQL only**: `[SQL1]` SQL generation → `[SQL2]` retry/correct loop → `[SQL3]` SQLite execution → `[SQL4]` PII guardrail filter → final result.
    - **Case 2 — Docs only**: `[DOC1]` retrieve policy context → policy-only answer.
    - **Case 3 — Hybrid**: `[H1]` policy extraction → `[H2]` policy-injected SQL generation → `[H3]` retry/correct loop → `[H4]` SQLite execution → `[H5]` PII guardrail filter → returns SQL result (policy text is only used to shape the SQL).
-5. Every stage emits a structured trace log so you can audit decisions end-to-end (see `logs/trace.jsonl`).
+6. Every stage emits a structured trace log so you can audit decisions end-to-end (see `logs/trace.jsonl`).
 
 Project layout
 --------------
@@ -29,7 +30,7 @@ Project layout
 - `app/docs_loader.py` — loads and searches policy docs.
 - `app/sql_executor.py` — SQLite executor with retry + LLM correction.
 - `app/pii.py` — PII detection and masking helpers.
-- `app/llm.py` — OpenAI wrapper with offline fallbacks.
+- `app/llm.py` — OpenAI wrapper for routing, SQL, and policy responses.
 - `app/logger.py` — structured JSON logging.
 - `data/store.db` — sample SQLite database (customers + orders).
 - `data/policies.md` — example business rules.
@@ -46,7 +47,7 @@ pip install -r requirements.txt  # use python3/pip3 if needed
 ```
 export OPENAI_API_KEY=sk-...
 ```
-Without a key, the agent uses heuristic fallbacks for routing and SQL generation.
+An OpenAI API key is required; without it, LLM calls will fail and should be retried after the key is configured.
 
 Run the CLI demo
 ----------------

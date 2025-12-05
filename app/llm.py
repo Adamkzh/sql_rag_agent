@@ -45,12 +45,16 @@ CLASSIFY_SCHEMA = {
 }
 
 
+class LLMUnavailableError(RuntimeError):
+    """Raised when the LLM client is not configured or reachable."""
+
+
 @dataclass
 class Classification:
     requires_sql: bool
     requires_policy: bool
     explanation: str = ""
-    source: str = "heuristic"
+    source: str = "llm"
     unknown: bool = False
 
     @property
@@ -97,9 +101,12 @@ class LLMClient:
             "restocking",
         ]
 
-    def _chat(self, messages: Any, tools: Optional[list] = None) -> Dict[str, Any]:
+    def _ensure_available(self) -> None:
         if not self.client:
-            raise RuntimeError("OpenAI client unavailable")
+            raise LLMUnavailableError("LLM unavailable: set OPENAI_API_KEY and retry.")
+
+    def _chat(self, messages: Any, tools: Optional[list] = None) -> Dict[str, Any]:
+        self._ensure_available()
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
@@ -109,15 +116,10 @@ class LLMClient:
         return response.to_dict()
 
     # Router
-    def classify_query(self, query: str) -> str:
-        """Return sql/docs/hybrid decision (logs inside classify_tools)."""
-        tools = self.classify_tools(query)
-        return tools["decision"]
-
     def classify_tools(self, query: str, *, skip_policy_rule: bool = False) -> Dict[str, Any]:
         """
         Final classification logic:
-        - policy keyword hit → requires_policy = True (NOT SQL!)
+        - policy keyword hit → requires_policy = True
         - LLM decides requires_sql / requires_policy
         - Final routing merges both
 
@@ -131,27 +133,21 @@ class LLMClient:
         if not skip_policy_rule:
             keyword_policy = self._policy_keyword_hit(query)  # e.g., "VIP", "return", "restocking"
 
-        # Step 2 — LLM judgment (boolean router)
-        if self.available:
-            llm_cls = self._classify_via_llm(query)
-        else:
-            llm_cls = self._heuristic_classification(query)
+        llm_cls = self._classify_via_llm(query)  # LLM classification
 
-        # Step 3 — Merge logic (MOST IMPORTANT PART)
-
+        # Step 3 — Merge logic 
         # Do NOT infer SQL from keyword hits!
         # Policy keywords only imply requires_policy.
-        merged_requires_policy = keyword_policy or llm_cls.requires_policy
+        requires_policy = keyword_policy or llm_cls.requires_policy
 
         # SQL requirement ALWAYS comes from LLM (never from keyword)
-        merged_requires_sql = llm_cls.requires_sql
+        requires_sql = llm_cls.requires_sql
 
         # Step 4 — Final decision
         final = Classification(
-            requires_sql=merged_requires_sql,
-            requires_policy=merged_requires_policy,
+            requires_sql=requires_sql,
+            requires_policy=requires_policy,
             explanation=llm_cls.explanation,
-            source="merged",
             unknown=llm_cls.unknown,
         )
 
@@ -159,8 +155,7 @@ class LLMClient:
 
 
     def extract_business_rule(self, question: str, fallback: str = "") -> str:
-        if not self.available:
-            return fallback
+        self._ensure_available()
         messages = [
             {"role": "system", "content": "Extract business rules relevant to the question."},
             {"role": "user", "content": question},
@@ -172,8 +167,7 @@ class LLMClient:
         return resp.choices[0].message.content or fallback
 
     def generate_sql(self, query: str, business_rule: str = "", schema: str = "") -> str:
-        if not self.available:
-            return self._heuristic_sql(query, business_rule)
+        self._ensure_available()
         system = (
             "You are a SQLite expert. Generate safe SELECT-only SQL. "
             "Return only the SQL statement with no explanation. "
@@ -190,8 +184,8 @@ class LLMClient:
         messages = [
             {"role": "system", "content": system},
             {
-            "role": "user",
-            "content": f"User query: {query}\nBusiness rule (must be enforced): {business_rule}",
+                "role": "user",
+                "content": f"User query: {query}\nBusiness rule (must be enforced): {business_rule}",
             },
         ]
         resp = self.client.chat.completions.create(
@@ -202,8 +196,7 @@ class LLMClient:
         return self._extract_sql(raw)
 
     def correct_sql(self, original_sql: str, error_message: str, schema: str = "") -> str:
-        if not self.available:
-            return original_sql
+        self._ensure_available()
         system = (
             "You are helping fix a SQLite query. Return only corrected SQL. "
             "Do not include explanations. "
@@ -225,45 +218,11 @@ class LLMClient:
         )
         return resp.choices[0].message.content or original_sql
 
-    def _heuristic_sql(self, query: str, business_rule: str) -> str:
-        # Extremely simple heuristic for offline/demo use.
-        rule_text = business_rule.lower()
-        if "vip" in rule_text:
-            return """
-            SELECT c.name, c.email, c.phone, c.address, SUM(o.amount) AS total_spent
-            FROM customers c
-            JOIN orders o ON o.customer_id = c.id
-            WHERE o.order_date >= date('now','-12 months')
-            GROUP BY c.id
-            HAVING total_spent > 1000
-            ORDER BY total_spent DESC;
-            """
-        if keyword_match(query, ["vip", "VIP"]):
-            return """
-            SELECT c.name, c.email, c.phone, c.address, SUM(o.amount) AS total_spent
-            FROM customers c
-            JOIN orders o ON o.customer_id = c.id
-            WHERE o.order_date >= date('now','-12 months')
-            GROUP BY c.id
-            HAVING total_spent > 1000
-            ORDER BY total_spent DESC;
-            """
-        if keyword_match(query, ["orders", "spend", "revenue"]):
-            return """
-            SELECT c.name, SUM(o.amount) AS total_spent, COUNT(o.id) AS order_count
-            FROM customers c
-            JOIN orders o ON o.customer_id = c.id
-            GROUP BY c.id
-            ORDER BY total_spent DESC;
-            """
-        return "SELECT * FROM customers LIMIT 5;"
-
     def answer_from_docs(self, question: str, context: str) -> str:
         """Answer using provided policy context only."""
         if not context.strip():
             return "No relevant policy found."
-        if not self.available:
-            return context
+        self._ensure_available()
         system = (
             "You are a compliance/policy assistant. Answer the question strictly using the provided policy snippets. "
             "If the policy does not contain the answer, say you do not have that information."
@@ -277,6 +236,34 @@ class LLMClient:
             messages=messages,
         )
         return resp.choices[0].message.content or context
+
+    def select_policy_context(self, question: str, policy_text: str, fallback: str = "") -> str:
+        """
+        Reduce a full policy document to only the snippets relevant to the question.
+        Returns the fallback (default: original text) if selection fails.
+        """
+        if not policy_text.strip():
+            return ""
+        self._ensure_available()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a retrieval filter. Given a policy document and a user question, "
+                    "return ONLY relevant sentences/paragraphs from document regarding the question. "
+                    "Do not invent content. If nothing is relevant, return an empty string."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Question: {question}\n\nPolicy document:\n{policy_text}",
+            },
+        ]
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+        )
+        return resp.choices[0].message.content or fallback or policy_text
 
     def _extract_sql(self, text: str) -> str:
         """Strip markdown/prose and keep the SQL statement."""
@@ -335,33 +322,6 @@ class LLMClient:
             source="llm",
             unknown=unknown,
         )
-
-    def _heuristic_classification(self, query: str) -> Classification:
-        if self._is_nonsense(query):
-            return Classification(
-                requires_sql=False,
-                requires_policy=False,
-                source="heuristic",
-                explanation="Query is empty or not understandable.",
-                unknown=True,
-            )
-        requires_policy = keyword_match(query, ["policy", "rule", "guideline"])
-        requires_sql = not requires_policy or keyword_match(
-            query, ["count", "list", "sum", "order", "customer", "product", "revenue", "amount"]
-        )
-        return Classification(
-            requires_sql=requires_sql,
-            requires_policy=requires_policy,
-            source="heuristic",
-            unknown=False,
-        )
-
-    def _is_nonsense(self, query: str) -> bool:
-        trimmed = query.strip()
-        if not trimmed:
-            return True
-        # If there are no letters or digits, it's nonsense (e.g., "!!!???").
-        return not any(ch.isalnum() for ch in trimmed)
 
     def _log_classification(self, query: str, classification: Classification) -> Dict[str, Any]:
         tools = classification.to_dict()

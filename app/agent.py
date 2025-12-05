@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from app.docs_loader import DocsLoader
-from app.llm import LLMClient
+from app.llm import LLMClient, LLMUnavailableError
 from app.logger import TraceLogger
 from app.router import Router
 from app.sql_executor import SQLExecutor
@@ -24,32 +24,42 @@ class Agent:
         self.sql = SQLExecutor(db_path, self.llm, self.logger)
 
     def handle(self, query: str) -> Dict[str, Any]:
-        if self._is_pii_request(query):
-            self.logger.log("pii", blocked=True, reason="raw PII requested")
-            return {
-                "message": (
-                    "I'm sorry, I cannot share customer PII. "
-                    "I can provide aggregated or de-identified results instead."
-                )
-            }
+        try:
+            self.logger.log("stage_agent_handle_start", query=query)
+            if self._is_pii_request(query):
+                self.logger.log("stage_pii_block", query=query, blocked=True, reason="raw PII requested")
+                return {
+                    "message": (
+                        "I'm sorry, I cannot share customer PII. "
+                        "I can provide aggregated or de-identified results instead."
+                    )
+                }
 
-        route_info = self.router.route(query)
-        decision = str(route_info.get("decision") or "docs")
-        self.logger.log(
-            "stage_case_selection",
-            decision=decision,
-            requires_sql=bool(route_info.get("requires_sql")),
-            requires_policy=bool(route_info.get("requires_policy")),
-            unknown=bool(route_info.get("unknown")),
-        )
+            route_info = self.router.route(query)
+            decision = str(route_info.get("decision") or "docs")
+            self.logger.log(
+                "stage_case_selection_result",
+                query=query,
+                normalized_query=route_info.get("normalized_query"),
+                decision=decision,
+                requires_sql=bool(route_info.get("requires_sql")),
+                requires_policy=bool(route_info.get("requires_policy")),
+                unknown=bool(route_info.get("unknown")),
+                policy_keyword_hit=bool(route_info.get("policy_keyword_hit")),
+                embedding_decision=route_info.get("embedding_decision"),
+                source=str(route_info.get("source") or "router"),
+            )
 
-        if route_info.get("unknown"):
-            return {"message": "I couldn't understand that request. Please rephrase or ask a specific question."}
-        if decision == "docs":
-            return self._handle_docs_case(query)
-        if decision == "hybrid":
-            return self._handle_hybrid_case(query)
-        return self._handle_sql_case(query)
+            if route_info.get("unknown"):
+                return {"message": "I couldn't understand that request. Please rephrase or ask a specific question."}
+            if decision == "docs":
+                return self._handle_docs_case(query)
+            if decision == "hybrid":
+                return self._handle_hybrid_case(query)
+            return self._handle_sql_case(query)
+        except LLMUnavailableError as exc:
+            self.logger.log("llm_unavailable", message=str(exc))
+            return {"message": str(exc)}
 
     def _is_pii_request(self, query: str) -> bool:
         lowered = query.lower()
@@ -58,7 +68,13 @@ class Agent:
     def _handle_docs_case(self, query: str) -> Dict[str, Any]:
         context = self._retrieve_policy_context(query, stage="stage_doc1_policy_retrieval")
         answer = self.llm.answer_from_docs(query, context)
-        self.logger.log("stage_doc_final_answer", mode="docs", has_context=bool(context.strip()))
+        self.logger.log(
+            "stage_doc_final_answer",
+            mode="docs",
+            query=query,
+            has_context=bool(context.strip()),
+            context_chars=len(context),
+        )
         return {"message": answer}
 
     def _handle_sql_case(self, query: str) -> Dict[str, Any]:
@@ -68,8 +84,14 @@ class Agent:
             schema=schema,
             stage="stage_sql1_generation",
         )
-        result = self._run_sql_pipeline(sql, schema=schema)
-        self.logger.log("stage_sql_final_answer", mode="sql")
+        result = self._run_sql_pipeline(sql, schema=schema, query=query)
+        self.logger.log(
+            "stage_sql_final_answer",
+            mode="sql",
+            query=query,
+            rows=len(result.get("rows", [])) if isinstance(result, dict) else 0,
+            error=result.get("error") if isinstance(result, dict) else None,
+        )
         return {"result": result}
 
     def _handle_hybrid_case(self, query: str) -> Dict[str, Any]:
@@ -87,18 +109,28 @@ class Agent:
             business_rule=policy_context,
             stage="stage_h2_sql_generation",
         )
-        result = self._run_sql_pipeline(sql, schema=schema)
-        self.logger.log("stage_h5_final_answer", mode="hybrid")
+        result = self._run_sql_pipeline(sql, schema=schema, query=query)
+        self.logger.log(
+            "stage_h5_final_answer",
+            mode="hybrid",
+            query=query,
+            rows=len(result.get("rows", [])) if isinstance(result, dict) else 0,
+            error=result.get("error") if isinstance(result, dict) else None,
+        )
         return {"result": result}
 
     def _retrieve_policy_context(self, query: str, stage: str) -> str:
-        context = self.docs.extract_rule(query)
+        full_context = self.docs.extract_rule(query)
+        selected = self.llm.select_policy_context(query, full_context, fallback=full_context)
+        print("WTF")
+        print(selected)
         self.logger.log(
             stage,
-            characters=len(context),
-            has_context=bool(context.strip()),
+            characters=len(selected),
+            has_context=bool(selected.strip()),
+            full_context_chars=len(full_context),
         )
-        return context
+        return selected
 
     def _generate_sql(self, query: str, *, schema: str, business_rule: str = "", stage: str) -> str:
         sql = self.llm.generate_sql(query, business_rule=business_rule, schema=schema)
@@ -109,14 +141,21 @@ class Agent:
         )
         return sql
 
-    def _run_sql_pipeline(self, sql: str, *, schema: str) -> Dict[str, Any]:
-        self.logger.log("stage_sql2_self_correction_loop", max_attempts=3)
+    def _run_sql_pipeline(self, sql: str, *, schema: str, query: str) -> Dict[str, Any]:
+        sql_preview = sql.strip()[:200]
+        self.logger.log(
+            "stage_sql2_self_correction_loop",
+            query=query,
+            max_attempts=3,
+            sql_preview=sql_preview,
+            schema_chars=len(schema),
+        )
         result = self.sql.execute_with_retry(sql, schema=schema)
-        print(result)
         rows = result.get("rows") if isinstance(result, dict) else None
         status = "success" if rows is not None else "error"
         self.logger.log(
             "stage_sql3_sqlite_execution",
+            query=query,
             status=status,
             rows=len(rows) if rows else 0,
             error=result.get("error") if isinstance(result, dict) else None,

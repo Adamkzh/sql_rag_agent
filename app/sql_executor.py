@@ -17,7 +17,10 @@ class SQLExecutor:
 
     def _is_safe(self, sql: str) -> bool:
         lowered = sql.lower().strip()
-        return lowered.startswith("select")
+        is_select = lowered.startswith("select")
+        if self.logger:
+            self.logger.log("stage_sql_guardrail_check", sql_preview=sql[:200], allowed=is_select)
+        return is_select
 
     def _run_sql(self, sql: str) -> Tuple[List[str], List[Dict[str, Any]]]:
         conn = sqlite3.connect(self.db_path)
@@ -32,6 +35,7 @@ class SQLExecutor:
             conn.close()
 
     def execute_with_retry(self, sql: str, max_attempts: int = 3, schema: str = "") -> Dict[str, Any]:
+        """Execute a SELECT with safety checks, retries, and PII masking."""
         original_sql = sql
         attempts: List[Dict[str, Any]] = []
         schema_text = schema or self.schema_summary()
@@ -43,10 +47,6 @@ class SQLExecutor:
                 return {"error": msg, "attempts": attempts}
             try:
                 columns, data = self._run_sql(sql)
-                print("WTF")
-                print(sql)
-                print(columns)
-                print(data)
                 masked_data = self._mask_rows(columns, data)
                 self.logger.log("sql_execute", attempt=attempt, status="success", rows=len(masked_data))
                 return {"columns": columns, "rows": masked_data, "attempts": attempts}
