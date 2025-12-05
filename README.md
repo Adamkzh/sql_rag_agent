@@ -4,51 +4,48 @@ Resilient Multi-Tool Agent (Text-to-SQL + Policy RAG)
 
 What it does
 ------------
-- Routes queries between SQL, docs, and hybrid modes using a multi-layer router (pre, policy keyword, embedding hook, LLM).
-- Injects business rules from `data/policies.md` (e.g., VIP > $1,000 in last 12 months) into SQL generation so constraints are enforced even if the user forgets them.
-- Generates SQLite-safe, SELECT-only SQL with a retry-and-correct loop.
-- Masks PII (email, phone, address) in result rows; blocks explicit PII requests.
-- Emits JSONL trace logs for each step to `logs/trace.jsonl`.
+- Multi-layer router (preprocess → policy keyword → embedding hint placeholder → LLM tools) decides docs vs. SQL vs. hybrid vs. unknown.
+- Hybrid SQL path injects business rules from `data/policies.md` (VIP > $88 in last 12 months, returns/refunds, restocking) even if the user omits them.
+- Policy-only path selects relevant snippets from the policy doc and answers strictly from that context.
+- SQLite pipeline generates SELECT-only SQL from the schema summary and retries with LLM correction on SQLite errors or empty result sets; non-SELECT is blocked.
+- Safety guardrails: blocks explicit PII requests and blocks result sets that include PII columns (`email`, `phone`, `address`).
+- Structured JSONL traces for each step are written to `logs/trace.jsonl`; the API returns the trace payload for the UI.
 
 
 Setup Instructions
 ------------------
 1) Install Python deps: `pip install -r requirements.txt` (use `python3/pip3` if needed).  
-2) Configure your OpenAI API key (required): `export OPENAI_API_KEY=sk-...`  
-3) Run the agent:  
+2) Configure your OpenAI API key (required for routing/SQL/doc answers): `export OPENAI_API_KEY=sk-...`  
+3) Run the agent (CLI):  
    - One-off: `python main.py "List VIP customers"`  
    - Interactive: `python main.py` then type a query.  
+   The agent will return a friendly message if the input is nonsense/unknown.
 
 
 Project layout
 --------------
-- `app/agent.py` — orchestrates routing, SQL/doc handling, PII guardrail.
-- `app/router/` — multi-layer routing (pre, policy keyword, embedding hook, LLM, dynamic).
-- `app/docs_loader.py` — loads and searches policy docs.
-- `app/sql_executor.py` — SQLite executor with retry + LLM correction.
-- `app/pii.py` — PII detection and masking helpers.
-- `app/llm.py` — OpenAI wrapper for routing, SQL, and policy responses.
+- `app/agent.py` — orchestrates routing, SQL/doc/hybrid handling, and PII guardrails.
+- `app/router/` — preprocess, policy keyword detection, embedding hint placeholder, LLM router, dynamic merger.
+- `app/docs_loader.py` — loads the policy doc; LLM later narrows to relevant snippets.
+- `app/llm.py` — OpenAI helper for routing classification, SQL generation/correction, and doc answering.
+- `app/sql_executor.py` — SQLite executor with SELECT-only guard, schema summary cache, retries, and PII column blocking.
+- `app/pii.py` — PII constants and masking helpers (blocking enforced in `SQLExecutor`).
 - `app/logger.py` — structured JSON logging.
 - `data/store.db` — sample SQLite database (customers + orders).
 - `data/policies.md` — example business rules.
 - `main.py` — CLI entry point.
-- `requirements.txt` — dependencies (OpenAI SDK).
+- `server.py` — FastAPI HTTP API.
+- `ui/` — React/Vite front-end that consumes the API.
+- `requirements.txt` — dependencies (OpenAI SDK, FastAPI, Uvicorn).
 
 
-Architecture (Self-Correction + PII)
-------------------------------------
-High-level routing: `pre-router → policy/embedding hints → LLM router → (docs | sql | hybrid pipelines)`.
-
-- **Self-Correction Loop (SQL2)**  
-  - `agent._generate_sql` asks the LLM for SELECT-only SQL (policy constraints injected when hybrid).  
-  - `sql_executor.execute_with_retry` runs the query with guardrails (`_is_safe` blocks non-SELECT).  
-  - On SQLite errors or empty result sets, `llm.correct_sql` gets the failing SQL, schema summary, and error context to produce a revised query; retries up to `max_attempts`.  
-  - Logging stages: `stage_sql1_generation`, `stage_sql2_self_correction_loop`, `stage_sql3_sqlite_execution`.
-
-- **PII Filter (SQL4 + request guard)**  
-  - Request-time: `agent.handle` blocks queries asking for `email/phone/address/pii` and returns a safe message.  
-  - Response-time: `sql_executor._mask_rows` detects columns in `PII_FIELDS` and masks via `mask_record`; logs `stage_sql4_pii_guardrail` with whether masking applied.  
-  - Only SELECT statements are ever executed (`stage_sql_guardrail_check`).
+Routing + execution
+-------------------
+- Router flow: preprocess/normalize → policy keyword hit (only toggles `requires_policy`) → embedding router placeholder → LLM tool-call classifier. Decisions are merged into docs/sql/hybrid/unknown.
+- Policy/hybrid: full policy doc is loaded, then `select_policy_context` trims to relevant snippets; `answer_from_docs` answers strictly from the provided context.
+- SQL generation: schema summary is passed to the LLM; business rules are injected on hybrid paths; SQL is forced to SELECT-only.
+- Self-correction loop: SQLite errors or empty result sets trigger LLM-driven `correct_sql` retries (up to 3 attempts) with the schema included.
+- PII guardrails: query-time PII keyword detection blocks requests; execution-time PII column detection blocks responses (no raw PII is returned).
 
 
 HTTP API + React UI
@@ -57,6 +54,7 @@ Backend (FastAPI):
 ```
 uvicorn server:app --reload --port 8000
 ```
+`POST /query` returns both the agent response and a step-by-step trace; `GET /health` is a basic liveness check.
 
 Frontend (React/Vite):
 ```
@@ -69,10 +67,11 @@ The UI expects the API at `http://localhost:8000`. Override with `VITE_API_URL` 
 
 Logs
 ----
-- JSONL traces are written to `logs/trace.jsonl`. Each line includes `step`, timestamps, and context.
+- JSONL traces are written to `logs/trace.jsonl`. Each line includes `step`, timestamps, and context. The FastAPI handler also returns the trace for downstream consumers.
 
 
 Notes
 -----
 - The sample DB is small and intended for local testing; swap `data/store.db` with your dataset as needed.
 - Only SELECT statements are executed; destructive SQL is blocked.
+- LLM access requires `OPENAI_API_KEY` in the environment. If missing/unreachable, the agent returns a clear error message instead of routing.
